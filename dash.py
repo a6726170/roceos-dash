@@ -214,6 +214,8 @@ class Sampler(threading.Thread):
         self.net_hist = {}          # iface -> [(ts, rx, tx)]
         self.ct_hist = []           # [(ts, {ip: (rx, tx)})] —— 每设备实时速率来源
         self.ct_ok = False          # conntrack accounting 是否可用
+        self.ct_live = False        # conntrack 字节数是否真的在变（被 flow offload 绕过时会一直是 False）
+        self._ct_prev = None
         self._tick = 0
         self.history = {
             "cpu": [], "load": [], "mem": [],
@@ -261,6 +263,17 @@ class Sampler(threading.Thread):
                 ct = conntrack_bytes()
                 if ct is not None:
                     self.ct_ok = True
+                    # 只对"两次快照都在"的 IP 求字节差：连接的新建/销毁会让总量变化，
+                    # 但被 flow offload 绕过的老连接字节数根本不动，这样能准确识别出来
+                    prev = self._ct_prev
+                    if prev is not None:
+                        moved = 0
+                        for ip, v in ct.items():
+                            p = prev.get(ip)
+                            if p:
+                                moved += abs(v[0] - p[0]) + abs(v[1] - p[1])
+                        self.ct_live = bool(moved)
+                    self._ct_prev = ct
                     with self.lock:
                         self.ct_hist.append((now, ct))
                         self.ct_hist = self.ct_hist[-4:]
@@ -335,6 +348,9 @@ class Sniffer(threading.Thread):
     ETH_P_ALL = 3
     WINDOW = 0.5            # 本地累计合并周期
     MAX_PKT = 20000         # 单窗口最多处理的包数（保护 CPU，超出即降采样）
+    BUFSIZE = 2048          # 关键：标准以太帧 <=1514 字节，用 65536 会让每个包都分配 64KB，
+                            # 在千包/秒的场景下光内存拷贝就吃掉十几个点 CPU
+    IDLE_ROUNDS = 2         # 连续几次巡检都零流量就跳过该口（省掉整条抓包链路）
 
     def __init__(self):
         super().__init__(daemon=True)
@@ -348,6 +364,28 @@ class Sniffer(threading.Thread):
         self.ifaces = []
         self.self_macs = set()
         self.workers = []
+        self._idle = {}             # iface -> 连续零流量次数
+        self._prev_pkts = {}
+
+    @staticmethod
+    def _master(iface):
+        """网卡若已加入网桥，返回网桥名（抓桥就能看到所有成员口的流量，避免重复抓）"""
+        for sub in ("master", os.path.join("brport", "bridge")):
+            p = os.path.join("/sys/class/net", iface, sub)
+            try:
+                return os.path.basename(os.readlink(p))
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _pkts(iface):
+        base = os.path.join("/sys/class/net", iface, "statistics")
+        try:
+            return (int(read(os.path.join(base, "rx_packets"), "0") or 0)
+                    + int(read(os.path.join(base, "tx_packets"), "0") or 0))
+        except Exception:
+            return 0
 
     # --- 选接口：up 且有 MAC 的以太网物理口 ---
     def pick_ifaces(self):
@@ -367,7 +405,28 @@ class Sniffer(threading.Thread):
                 continue
             self.self_macs.add(mb)
             (phys if os.path.exists(os.path.join(base, "device")) else virt).append(i)
-        return phys or virt
+
+        # 网桥成员口 → 改抓网桥本身（一个桥覆盖所有成员口，省掉 N 条抓包链路）
+        targets, seen = [], set()
+        for i in phys:
+            t = self._master(i) or i
+            if t not in seen:
+                seen.add(t)
+                targets.append(t)
+
+        # 零流量的口整条链路停掉（计数来自 sysfs，有流量时下个周期会自动恢复）
+        cur = {i: self._pkts(i) for i in targets}
+        active = []
+        for i in targets:
+            prev = self._prev_pkts.get(i)
+            if prev is not None and cur[i] == prev:
+                self._idle[i] = self._idle.get(i, 0) + 1
+            else:
+                self._idle[i] = 0
+            if self._idle.get(i, 0) < self.IDLE_ROUNDS:
+                active.append(i)
+        self._prev_pkts = cur
+        return active
 
     def _open(self, iface):
         try:
@@ -391,7 +450,7 @@ class Sniffer(threading.Thread):
                 n = 0
                 while n < self.MAX_PKT:
                     try:
-                        data = sock.recv(65536)
+                        data = sock.recv(self.BUFSIZE)
                     except BlockingIOError:
                         break
                     except Exception:
@@ -415,10 +474,17 @@ class Sniffer(threading.Thread):
         n = len(data)
         if n < 14:
             return
-        et = data[12:14]
-        if et != b"\x08\x00" and et != b"\x86\xdd":     # 只统计 IPv4 / IPv6
+        d12 = data[12]                                   # 只统计 IPv4(0x0800) / IPv6(0x86dd)
+        if d12 == 8:
+            if data[13]:
+                return
+        elif d12 == 0x86:
+            if data[13] != 0xDD:
+                return
+        else:
             return
-        dst, src = data[0:6], data[6:12]
+        src = data[6:12]
+        dst = data[0:6]
         mine = self.self_macs
         if src in mine:                                  # 网关发出 → 设备下行
             if dst[0] & 1:                               # 广播/组播不算到单个设备
@@ -437,7 +503,10 @@ class Sniffer(threading.Thread):
 
     def run(self):
         while True:
-            want = self.pick_ifaces()
+            # conntrack 字节数是活的，就完全不抓包（抓包在千包/秒的场景要十几个点 CPU，
+            # conntrack 读一遍只要几毫秒）；哪天 conntrack 被 flow offload 绕过不动了，
+            # 下个周期会自动恢复抓包
+            want = [] if SAMPLER.ct_live else self.pick_ifaces()
             have = set(self.ifaces)
             if want != self.ifaces:
                 self.ifaces = want
@@ -455,7 +524,7 @@ class Sniffer(threading.Thread):
                     threading.Thread(target=self._worker, args=(iface, s),
                                      daemon=True).start()
                 self.active = bool(self.workers)
-            time.sleep(30)
+            time.sleep(15)
 
     def tick(self):
         """每 3 秒结算一次速率：设备视角 rx=下行(下载)、tx=上行(上传)"""
@@ -861,19 +930,35 @@ SYS_NOISE = ("systemd-", "dbus", "getty", "user@", "session-", "udisks2", "polki
              "colord", "cron", "rsyslog", "ModemManager", "wpa_supplicant", "avahi-daemon")
 
 
+_SVC_CACHE = [0.0, []]      # [时间戳, 服务列表]   —— 5 秒
+_UF_CACHE = [0.0, {}]       # [时间戳, unit 文件表] —— 300 秒
+
+
 def collect_services():
-    """只显示本机真实存在的服务（非 iNextOS / Debian 通用机上也不会出现一堆灰灯）。"""
-    running, installed = set(), {}
+    """只显示本机真实存在的服务（非 iNextOS / Debian 通用机上也不会出现一堆灰灯）。
+
+    性能：systemctl list-unit-files 在弱 CPU（如 J4125）上要 1~1.5 秒，而页面每 3 秒
+    刷一次，逐个请求重跑会白白吃掉半个核。unit 文件清单几乎不变 → 缓存 5 分钟；
+    最终服务列表缓存 5 秒（多标签页同时打开也只算一次）。
+    """
+    now = time.time()
+    if _SVC_CACHE[0] and now - _SVC_CACHE[0] < 5.0:
+        return _SVC_CACHE[1]
+    running = set()
     for line in sh("systemctl list-units --type=service --state=running "
                    "--no-legend --plain").splitlines():
         p = line.split()
         if p:
             running.add(p[0].replace(".service", ""))
-    for line in sh("systemctl list-unit-files --type=service "
-                   "--no-legend --plain").splitlines():
-        p = line.split()
-        if p:
-            installed[p[0].replace(".service", "")] = p[1] if len(p) > 1 else ""
+    if not (_UF_CACHE[0] and now - _UF_CACHE[0] < 300.0):
+        installed = {}
+        for line in sh("systemctl list-unit-files --type=service "
+                       "--no-legend --plain").splitlines():
+            p = line.split()
+            if p:
+                installed[p[0].replace(".service", "")] = p[1] if len(p) > 1 else ""
+        _UF_CACHE[0], _UF_CACHE[1] = now, installed
+    installed = _UF_CACHE[1]
     names = []
     for s in WATCH_SERVICES:
         if s in installed or s in running:
@@ -888,7 +973,9 @@ def collect_services():
         extra = [s for s in sorted(running)
                  if not any(s.startswith(x) for x in SYS_NOISE) and s not in names]
         names += extra[:16 - len(names)]
-    return [{"name": s, "active": s in running} for s in names]
+    out = [{"name": s, "active": s in running} for s in names]
+    _SVC_CACHE[0], _SVC_CACHE[1] = now, out
+    return out
 
 def collect_all():
     sysinfo = collect_system()
@@ -905,7 +992,7 @@ def collect_all():
         "devices": collect_devices(),
         "services": collect_services(),
         "sources": {"db": db_path() or "", "leases": lease_file() or "",
-                    "conntrack": SAMPLER.ct_ok,
+                    "conntrack": SAMPLER.ct_ok, "ct_live": SAMPLER.ct_live,
                     "sniff": SNIFFER.active,
                     "sniff_ifaces": SNIFFER.ifaces},
     }
@@ -1253,7 +1340,8 @@ function render(d){
   $('kernel2').textContent = s.kernel;
   const src = d.sources||{};
   const rateTxt = src.sniff ? '网口抓包统计（'+((src.sniff_ifaces||[]).join('/')||'-')+'）'
-                            : (src.conntrack ? '连接跟踪 conntrack' : '本小时均值估算');
+                            : (src.ct_live ? '连接跟踪 conntrack（抓包已自动关闭，省 CPU）'
+                                           : '本小时均值估算');
   $('srcInfo').textContent = '/proc · /sys/class/net · 路由表 · resolv.conf · '
       + '设备实时速率来源：' + rateTxt
       + (src.leases? ' · DHCP 租约' : ' · 未找到 DHCP 租约')
@@ -1579,10 +1667,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global ACTUAL_PORT
     SAMPLER.start()
-    try:
-        SNIFFER.start()                 # 需要 root；无权限时静默失败，退化为其它速率来源
-    except Exception:
-        pass
+    if os.environ.get("ROCEOS_DASH_SNIFF", "1") != "0":
+        try:
+            SNIFFER.start()             # 需要 root；无权限时静默失败，退化为其它速率来源
+        except Exception:
+            pass
+    else:
+        SNIFFER.active = False
     time.sleep(1.2)
     srv = None
     for p in range(PORT, PORT + 11):        # 端口被占用就顺延，避免直接起不来
