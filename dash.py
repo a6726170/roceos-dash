@@ -614,15 +614,24 @@ def is_physical(iface):
     return bool(drv)
 
 
-def iface_active(info):
-    """虚拟网卡只有“真在工作”时才展示：链路 up / 有 IP / 有实时流量。"""
-    if info["carrier"]:
+def iface_active(info, wan_dev=""):
+    """虚拟网卡只有"真在工作"时才展示。
+
+    规则：必须自己有 IP（说明确实在承载三层通信），并且有流量或链路。
+    这样会自动隐藏：docker0（没起容器时零流量）、virbr0、没加入网络的 ZeroTier 口。
+    ifb* 是 tc 流量整形的垫片设备，流量与真实口完全重复，直接排除。
+    WAN 口无条件保留（哪怕瞬时没流量，也不该从页面消失）。
+    """
+    if info["name"].startswith("ifb"):
+        return False
+    if wan_dev and info["name"] == wan_dev:
         return True
-    if info["ip"] and info["state"] in ("up", "unknown"):
-        return True
-    if info["rx_rate"] + info["tx_rate"] > 1024:
-        return True
-    return False
+    # 只有链路本地 IPv6（fe80::）不算"在用"——未加入网络的 ZeroTier / 空网桥都是这种
+    l3 = bool(info["ip"]) or any(
+        not a.lower().startswith("fe80:") for a in (info["ipv6"] or []))
+    if not l3:
+        return False
+    return info["rx_rate"] + info["tx_rate"] > 1024 or info["carrier"]
 
 
 def collect_ifaces():
@@ -632,6 +641,7 @@ def collect_ifaces():
         p = line.split()
         if len(p) >= 4 and p[2] in ("inet", "inet6"):
             addrs.setdefault(p[1], []).append(p[3])
+    wd = detect_wan_dev()[0]
     for iface in sorted(os.listdir("/sys/class/net")):
         if iface in SKIP_IFACES:
             continue
@@ -669,7 +679,7 @@ def collect_ifaces():
             "physical": is_physical(iface),
         }
         # 只展示物理网卡；虚拟网卡（docker/virbr/veth…）未工作时不显示
-        if not info["physical"] and not iface_active(info):
+        if not info["physical"] and not iface_active(info, wd):
             continue
         out[iface] = info
     # 物理网卡排前面
