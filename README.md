@@ -9,10 +9,14 @@
 curl -fsSL https://raw.githubusercontent.com/a6726170/roceos-dash/main/install.sh | bash
 ```
 
-国内访问 GitHub 慢时用 jsDelivr 镜像（同一份脚本）：
+备用地址（国内网络 / GitHub 不通时）：
 
 ```bash
+# jsDelivr CDN 镜像
 curl -fsSL https://cdn.jsdelivr.net/gh/a6726170/roceos-dash@main/install.sh | bash
+
+# 直连镜像站
+curl -fsSL https://inextos-dash.app.workbuddy.host/install.txt | bash
 ```
 
 脚本会自动完成：找 python3 → 写文件到 `/opt/roceos-dash/` → 语法自检 → 创建并启用 systemd
